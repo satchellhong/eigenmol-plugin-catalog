@@ -1,0 +1,33 @@
+{
+  "format": "eigenmol-plugin-catalog-entry",
+  "schema_version": 1,
+  "id": "org.example.validation-check",
+  "name": "Validation check (test, not for merging)",
+  "summary": "A deliberately unusable listing that shows the checks refusing a package that cannot be downloaded.",
+  "description": "Opened to test the catalog workflow. This pull request is closed without merging.",
+  "publisher": {
+    "name": "Catalog tests",
+    "url": "https://example.org"
+  },
+  "category": "example",
+  "license": "MIT",
+  "homepage": "https://example.org/fixture",
+  "source_repository": "https://example.org/fixture/source",
+  "status": "active",
+  "network": {
+    "setup": false,
+    "runs": false,
+    "note": ""
+  },
+  "releases": [
+    {
+      "version": "1.0.0",
+      "url": "https://example.org/validation-check-1.0.0.zip",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "size": 1024,
+      "platforms": [],
+      "plugin_spec": "1.2",
+      "published": "2026-11-11"
+    }
+  ]
+}
