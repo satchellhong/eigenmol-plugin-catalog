@@ -1,0 +1,26 @@
+{
+  "format": "eigenmol-plugin-catalog-entry",
+  "schema_version": 1,
+  "id": "org.example.fixture",
+  "name": "Validator test fixture",
+  "summary": "Test data for tools/catalog.py. Not a plugin and not part of the catalog.",
+  "description": "Used only by tests/test_catalog.py. The address below serves nothing.",
+  "publisher": { "name": "Catalog tests", "url": "https://example.org" },
+  "category": "example",
+  "license": "MIT",
+  "homepage": "https://example.org/fixture",
+  "source_repository": "https://example.org/fixture/source",
+  "status": "active",
+  "network": { "setup": false, "runs": false, "note": "" },
+  "releases": [
+    {
+      "version": "1.0.0",
+      "url": "https://example.org/fixture-1.0.0.zip",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "size": 1024,
+      "platforms": [],
+      "plugin_spec": "1.2",
+      "published": "2026-11-11"
+    }
+  ]
+}

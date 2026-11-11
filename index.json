@@ -1,0 +1,7 @@
+{
+  "format": "eigenmol-plugin-catalog",
+  "schema_version": 1,
+  "name": "EigenMol plugin catalog",
+  "homepage": "https://github.com/satchellhong/eigenmol-plugin-catalog",
+  "plugins": []
+}
