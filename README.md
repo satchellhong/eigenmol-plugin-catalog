@@ -53,6 +53,13 @@ run, or that its scientific results are correct. A plugin runs on the user's
 computer with the user's permissions. EigenMol shows the program it will run
 before it is enabled, and installs every plugin disabled.
 
+## Writing a plugin
+
+[`spec/`](spec/README.md) is the plugin specification, the tutorial, the
+templates and the packaging tool — everything needed to write a plugin
+without EigenMol's source. It is a generated copy of the documentation
+EigenMol ships with; changes are made there and copied here.
+
 ## Plugins that are not listed
 
 A plugin does not have to be in this catalog to be used. EigenMol installs a

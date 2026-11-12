@@ -1,0 +1,38 @@
+{
+  "id": "org.example.atomcounts",
+  "name": "Atom counts (starter template)",
+  "version": "0.1.0",
+  "spec_version": "1.2",
+  "protocol": 1,
+  "runtime": "process",
+  "entrypoint": "/usr/bin/env",
+  "args": ["python3", "atomcounts_plugin.py"],
+  "description": "Counts the atoms of the open structure by element and by chain. A starter template for an EigenMol plugin: real (if simple) arithmetic, no external program.",
+  "author": "Your name",
+  "homepage": "",
+  "license": "Choose a licence before you publish",
+  "source": "",
+  "platforms": ["macos", "linux"],
+  "capabilities": ["read_current_structure", "create_result"],
+  "check": {
+    "description": "Reports the Python version.",
+    "commands": {
+      "macos": ["/usr/bin/env", "python3", "atomcounts_plugin.py", "--check"],
+      "linux": ["/usr/bin/env", "python3", "atomcounts_plugin.py", "--check"]
+    }
+  },
+  "system": {
+    "gpu": "none",
+    "notes": "Needs python3 3.8 or newer on the PATH. Standard library only."
+  },
+  "actions": [
+    {
+      "id": "count_atoms",
+      "name": "Count atoms by element and chain",
+      "extension_point": "analysis_action",
+      "inputs": ["current_structure"],
+      "results": ["table", "metadata"],
+      "coordinate_dependent": false
+    }
+  ]
+}
