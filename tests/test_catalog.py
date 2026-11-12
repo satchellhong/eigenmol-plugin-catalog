@@ -215,5 +215,190 @@ class Scale(unittest.TestCase):
         self.assertEqual(fetched, ["https://example.org/new.zip"])
 
 
+class Availability(unittest.TestCase):
+    """The weekly report: newest releases only, capped, HEAD with a ranged-GET
+    fallback, and never a download."""
+
+    class Response:
+        def __init__(self, status):
+            self.status = status
+            self.read_sizes = []
+
+        def read(self, size=-1):
+            self.read_sizes.append(size)
+            return b"x"[: max(size, 0)]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+    def opener(self, answers):
+        """A fake `urlopen` answering each method with a status; records calls."""
+        import urllib.error
+
+        calls = []
+
+        def open_(request, timeout):
+            calls.append((request.get_method(), dict(request.header_items()), timeout))
+            status = answers[request.get_method()]
+            if status >= 400:
+                raise urllib.error.HTTPError(request.full_url, status, "x", {}, None)
+            response = Availability.Response(status)
+            calls.append(response)
+            return response
+
+        return open_, calls
+
+    def test_a_head_answer_is_one_request(self):
+        opener, calls = self.opener({"HEAD": 200})
+        self.assertEqual(catalog.head_status("https://example.org/a.zip", opener), (200, "HEAD"))
+        self.assertEqual([c[0] for c in calls if isinstance(c, tuple)], ["HEAD"])
+        self.assertEqual(calls[0][2], catalog.AVAILABILITY_TIMEOUT)
+
+    def test_a_refused_head_falls_back_to_one_byte(self):
+        for refused in (403, 405, 501):
+            opener, calls = self.opener({"HEAD": refused, "GET": 206})
+            self.assertEqual(
+                catalog.head_status("https://example.org/a.zip", opener), (206, "GET bytes=0-0")
+            )
+            get = [c for c in calls if isinstance(c, tuple)][1]
+            self.assertEqual(get[1].get("Range"), "bytes=0-0", refused)
+            response = [c for c in calls if isinstance(c, Availability.Response)][-1]
+            self.assertEqual(response.read_sizes, [1], "at most one byte is read")
+
+    def test_a_missing_file_is_not_retried_as_a_get(self):
+        opener, calls = self.opener({"HEAD": 404, "GET": 200})
+        self.assertEqual(catalog.head_status("https://example.org/a.zip", opener), (404, "HEAD"))
+        self.assertEqual([c[0] for c in calls if isinstance(c, tuple)], ["HEAD"])
+
+    def test_only_the_newest_release_by_default_and_a_cap(self):
+        entries = Scale().entries()
+        pairs, left = catalog.availability_targets(entries)
+        self.assertEqual(len(pairs), catalog.AVAILABILITY_LIMIT)
+        self.assertEqual(left, len(entries) - catalog.AVAILABILITY_LIMIT)
+        self.assertTrue(all(release is entry["releases"][0] for entry, release in pairs))
+        every, _ = catalog.availability_targets(entries, every_release=True, limit=10_000)
+        self.assertEqual(len(every), 3 * len(entries))
+
+    def test_failures_are_sentences_and_the_budget_stops_asking(self):
+        entry = fixture("org.example.fixture.json")
+        answers = iter([(200, "HEAD"), (404, "HEAD")])
+        failures, unasked = catalog.check_availability(
+            [(entry, entry["releases"][0])] * 2, status=lambda url: next(answers)
+        )
+        self.assertEqual(unasked, 0)
+        self.assertEqual(len(failures), 1)
+        self.assertIn("HTTP 404 (HEAD)", failures[0])
+
+        def broken(url):
+            raise TimeoutError("timed out")
+
+        failures, _ = catalog.check_availability([(entry, entry["releases"][0])], status=broken)
+        self.assertIn("no answer (timed out)", failures[0])
+        ticks = iter([0, 0, 1000, 1000])
+        failures, unasked = catalog.check_availability(
+            [(entry, entry["releases"][0])] * 3,
+            status=lambda url: (200, "HEAD"),
+            budget=10,
+            clock=lambda: next(ticks),
+        )
+        self.assertEqual((failures, unasked), ([], 2))
+
+
+class ChangedFiles(unittest.TestCase):
+    """What `verify --changed` reads from git, on a real repository."""
+
+    def git(self, *args):
+        import subprocess
+
+        subprocess.run(["git", *args], cwd=self.root, check=True, capture_output=True)
+
+    def write(self, plugin_id, entry):
+        (self.root / "plugins" / f"{plugin_id}.json").write_text(json.dumps(entry), encoding="utf-8")
+
+    def setUp(self):
+        import tempfile
+
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        (self.root / "plugins").mkdir()
+        self.git("init", "-q", "-b", "main")
+        self.git("config", "user.email", "test@example.org")
+        self.git("config", "user.name", "test")
+        base = fixture("org.example.fixture.json")
+        for name in ("org.example.a", "org.example.b", "org.example.c"):
+            self.write(name, dict(base, id=name))
+        self.git("add", ".")
+        self.git("commit", "-q", "-m", "base")
+        self.git("checkout", "-q", "-b", "change")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def commit(self):
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "change")
+
+    def test_a_deleted_entry_names_nothing_to_download(self):
+        (self.root / "plugins" / "org.example.b.json").unlink()
+        self.commit()
+        self.assertEqual(catalog.changed_ids("main", self.root), [])
+
+    def test_a_deleted_release_downloads_nothing(self):
+        entry = fixture("org.example.fixture.json")
+        before = dict(entry, id="org.example.a")
+        before["releases"] = [
+            dict(entry["releases"][0], version="1.1.0", url="https://example.org/a-1.1.0.zip"),
+            entry["releases"][0],
+        ]
+        self.write("org.example.a", before)
+        self.commit()
+        self.git("checkout", "-q", "-b", "drop")
+        after = dict(before, releases=before["releases"][1:])
+        self.write("org.example.a", after)
+        self.commit()
+        self.assertEqual(catalog.changed_ids("change", self.root), ["org.example.a"])
+        self.assertEqual(
+            catalog.changed_releases(after, catalog.entry_at("change", "org.example.a", self.root)), []
+        )
+
+    def test_a_changed_id_is_a_new_entry_and_verifies_everything(self):
+        self.git("mv", "plugins/org.example.c.json", "plugins/org.example.renamed.json")
+        entry = json.loads((self.root / "plugins" / "org.example.renamed.json").read_text())
+        entry["id"] = "org.example.renamed"
+        self.write("org.example.renamed", entry)
+        self.commit()
+        self.assertEqual(catalog.changed_ids("main", self.root), ["org.example.renamed"])
+        before = catalog.entry_at("main", "org.example.renamed", self.root)
+        self.assertIsNone(before)
+        self.assertEqual(catalog.changed_releases(entry, before), entry["releases"])
+
+    def test_a_metadata_edit_names_the_entry_and_downloads_nothing(self):
+        entry = json.loads((self.root / "plugins" / "org.example.a.json").read_text())
+        entry["summary"] = "Reworded."
+        self.write("org.example.a", entry)
+        self.commit()
+        self.assertEqual(catalog.changed_ids("main", self.root), ["org.example.a"])
+        before = catalog.entry_at("main", "org.example.a", self.root)
+        self.assertEqual(catalog.changed_releases(entry, before), [])
+
+    def test_one_change_among_many_is_the_only_one_named(self):
+        entry = json.loads((self.root / "plugins" / "org.example.b.json").read_text())
+        entry["releases"][0]["sha256"] = "2" * 64
+        self.write("org.example.b", entry)
+        self.commit()
+        self.assertEqual(catalog.changed_ids("main", self.root), ["org.example.b"])
+        before = catalog.entry_at("main", "org.example.b", self.root)
+        self.assertEqual(len(catalog.changed_releases(entry, before)), 1)
+
+    def test_a_bad_address_is_refused_before_anything_is_downloaded(self):
+        entry = json.loads((self.root / "plugins" / "org.example.a.json").read_text())
+        entry["releases"][0]["url"] = "https://github.com/someone/x/archive/refs/heads/main.zip"
+        problems = catalog.check_entry(entry, "org.example.a.json")
+        self.assertTrue(any("url" in p or "package" in p for p in problems), problems)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -9,9 +9,12 @@ name: Validate catalog
 # main: the same metadata checks, and no downloads — every package on main
 # was verified by the pull request that added it.
 #
-# Weekly: the metadata checks and an availability check that asks each
-# listed address whether it still answers (HEAD; nothing downloaded). That is
-# not an integrity check, and it is reported as one only of availability.
+# Weekly: the metadata checks, and — as its own job that never fails the
+# run — an availability report asking each plugin's newest package address
+# whether it still answers: HEAD, or a one-byte ranged GET where a server
+# refuses HEAD (403/405/501). At most 300 addresses, 15 s each, 15 min in
+# all. That is not an integrity check, and it is reported only as
+# availability.
 # `workflow_dispatch` can download and verify named plugins on demand.
 #
 # Nothing here extracts or runs a package. The token is read-only and a pull
@@ -55,10 +58,6 @@ jobs:
         if: github.event_name == 'pull_request'
         run: python3 tools/catalog.py verify --changed "origin/${{ github.base_ref }}"
 
-      - name: Listed addresses still answer (availability only)
-        if: github.event_name == 'schedule'
-        run: python3 tools/catalog.py availability
-
       - name: Verify the plugins named by hand
         if: github.event_name == 'workflow_dispatch' && inputs.ids != ''
         env:
@@ -66,3 +65,15 @@ jobs:
         run: |
           set -f
           python3 tools/catalog.py verify $IDS
+
+  # A report, not a gate: a host that is slow or down for an hour must not
+  # turn the catalog red, and a pull request never waits for it.
+  availability:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Newest package addresses still answer (availability only)
+        run: python3 tools/catalog.py availability --limit 300

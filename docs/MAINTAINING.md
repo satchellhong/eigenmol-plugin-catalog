@@ -50,9 +50,12 @@ Ask for changes in the pull request. Decline a listing that cannot be fixed.
 
 - `main` runs the metadata checks only: every package on `main` was
   downloaded and verified by the pull request that added it.
-- The weekly run checks the metadata and asks each listed address whether it
-  still answers (`tools/catalog.py availability`: one HEAD request per
-  release, nothing downloaded). That is **availability, not integrity**: a
+- The weekly run checks the metadata and, as a separate job that never turns
+  the run red, asks each plugin's **newest** package address whether it still
+  answers (`tools/catalog.py availability`: one HEAD request, or a one-byte
+  ranged GET where the server refuses HEAD with 403, 405 or 501; at most 300
+  addresses, 15 s each, 15 minutes in all; `--all` asks about every release).
+  That is **availability, not integrity**: a
   package whose bytes changed under the same address is caught by the
   checksum EigenMol holds every download to at install time, not by this run.
   A failure means a package disappeared: open an issue with the publisher,

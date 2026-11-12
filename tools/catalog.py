@@ -9,10 +9,12 @@
     python3 tools/catalog.py verify --changed REF
                                                download only the releases a
                                                change adds or edits against REF
-    python3 tools/catalog.py availability [--latest]
-                                               ask each listed address whether
-                                               it still answers (HEAD; nothing
-                                               is downloaded or checked)
+    python3 tools/catalog.py availability [--all] [--limit N]
+                                               ask each plugin's newest package
+                                               address whether it still answers
+                                               (HEAD, or a 1-byte ranged GET where
+                                               HEAD is refused; nothing else is
+                                               downloaded or checked)
 
 Standard library only, so it runs the same on a contributor's laptop and in
 CI without installing anything.
@@ -399,11 +401,11 @@ def verify_release(entry: dict, release: dict, fetch=download) -> list[str]:
 PACKAGE_FIELDS = ("version", "url", "sha256", "size", "platforms", "plugin_spec")
 
 
-def entry_at(ref: str, plugin_id: str) -> dict | None:
+def entry_at(ref: str, plugin_id: str, root: Path = ROOT) -> dict | None:
     """The entry as it is at a git ref, or None when it did not exist there."""
     result = subprocess.run(
         ["git", "show", f"{ref}:plugins/{plugin_id}.json"],
-        cwd=ROOT,
+        cwd=root,
         capture_output=True,
         text=True,
     )
@@ -439,11 +441,12 @@ def changed_releases(entry: dict, before: dict | None) -> list[dict]:
     return out
 
 
-def changed_ids(ref: str) -> list[str]:
-    """Plugin ids whose entry files differ from `ref` (added or modified)."""
+def changed_ids(ref: str, root: Path = ROOT) -> list[str]:
+    """Plugin ids whose entry files differ from `ref`: added, modified, or the
+    new name of a renamed file. A deleted entry names nothing to download."""
     result = subprocess.run(
         ["git", "diff", "--name-only", "--diff-filter=AMR", f"{ref}...HEAD", "--", "plugins/"],
-        cwd=ROOT,
+        cwd=root,
         capture_output=True,
         text=True,
     )
@@ -457,20 +460,91 @@ def changed_ids(ref: str) -> list[str]:
     return ids
 
 
-def head_status(url: str) -> int:
-    """The HTTP status a HEAD request for `url` ends at (redirects followed).
+# The answers to a HEAD request that mean "this server does not do HEAD here",
+# not "the file is gone". GitHub's release CDN and some object stores answer
+# HEAD with 403 or 405; a ranged GET of one byte asks the same question.
+HEAD_NOT_SUPPORTED = {403, 405, 501}
 
-    Availability only: nothing is downloaded, so this says the address still
-    answers, not that the bytes still match. Integrity is `verify`'s job.
+# Availability limits: a weekly report, not a crawl. One request per listed
+# address (two when HEAD is refused), each with its own timeout, and a cap on
+# how many addresses one run asks about.
+AVAILABILITY_TIMEOUT = 15
+AVAILABILITY_LIMIT = 300
+
+
+def head_status(url: str, opener=None, timeout: float = AVAILABILITY_TIMEOUT) -> tuple[int, str]:
+    """The HTTP status `url` answers with, and how it was asked (`HEAD`, or
+    `GET bytes=0-0` when the server refuses HEAD). Redirects are followed.
+
+    Availability only: at most one byte is read, so this says the address
+    still answers, not that the bytes still match. Integrity is `verify`'s job.
     """
-    request = urllib.request.Request(
-        url, method="HEAD", headers={"User-Agent": "eigenmol-plugin-catalog-availability"}
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310 - https only
-            return response.status
-    except urllib.error.HTTPError as error:
-        return error.code
+    opener = opener or urllib.request.urlopen
+
+    def ask(method: str, headers: dict) -> int:
+        request = urllib.request.Request(
+            url,
+            method=method,
+            headers={"User-Agent": "eigenmol-plugin-catalog-availability", **headers},
+        )
+        try:
+            with opener(request, timeout=timeout) as response:  # noqa: S310 - https only
+                if method == "GET":
+                    response.read(1)
+                return response.status
+        except urllib.error.HTTPError as error:
+            return error.code
+
+    status = ask("HEAD", {})
+    if status in HEAD_NOT_SUPPORTED:
+        return ask("GET", {"Range": "bytes=0-0"}), "GET bytes=0-0"
+    return status, "HEAD"
+
+
+def availability_targets(
+    entries: list[dict], every_release: bool = False, limit: int = AVAILABILITY_LIMIT
+) -> tuple[list[tuple[dict, dict]], int]:
+    """The (entry, release) pairs one availability run asks about, and how
+    many it left out because of `limit`.
+
+    By default only each plugin's newest listed release: that is the one the
+    application offers first, and older releases were verified when they were
+    added. `every_release` asks about all of them.
+    """
+    pairs = []
+    for entry in entries:
+        releases = entry["releases"] if every_release else entry["releases"][:1]
+        pairs.extend((entry, release) for release in releases)
+    return pairs[:limit], max(0, len(pairs) - limit)
+
+
+AVAILABILITY_BUDGET = 900  # seconds for a whole run
+
+
+def check_availability(
+    pairs: list[tuple[dict, dict]],
+    status=head_status,
+    budget: float = AVAILABILITY_BUDGET,
+    clock=None,
+) -> tuple[list[str], int]:
+    """One sentence per address that did not answer with a success, and how
+    many addresses were not asked because the run's time budget ran out."""
+    import time
+
+    clock = clock or time.monotonic
+    started = clock()
+    failures = []
+    for index, (entry, release) in enumerate(pairs):
+        if clock() - started > budget:
+            return failures, len(pairs) - index
+        try:
+            code, method = status(release["url"])
+        except Exception as error:  # noqa: BLE001 - every failure is a sentence
+            failures.append(f"{entry['id']} {release['version']}: no answer ({error})")
+            continue
+        if code >= 400:
+            failures.append(f"{entry['id']} {release['version']}: HTTP {code} ({method})")
+    return failures, 0
 
 
 # ---------------------------------------------------------------------------
@@ -492,10 +566,17 @@ def main(argv: list[str] | None = None) -> int:
         help="verify only the releases added or edited since REF (a pull request's base)",
     )
     availability = commands.add_parser(
-        "availability", help="HEAD each listed package address; downloads nothing"
+        "availability",
+        help="ask each plugin's newest package address whether it answers; downloads nothing",
     )
     availability.add_argument(
-        "--latest", action="store_true", help="only each plugin's newest listed release"
+        "--all", action="store_true", help="every listed release, not only each plugin's newest"
+    )
+    availability.add_argument(
+        "--limit",
+        type=int,
+        default=AVAILABILITY_LIMIT,
+        help=f"ask about at most this many addresses (default {AVAILABILITY_LIMIT})",
     )
     arguments = parser.parse_args(argv)
 
@@ -524,25 +605,19 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if arguments.command == "availability":
-        failures = []
-        checked = 0
-        for entry in entries:
-            releases = entry["releases"][:1] if arguments.latest else entry["releases"]
-            for release in releases:
-                checked += 1
-                try:
-                    status = head_status(release["url"])
-                except Exception as error:  # noqa: BLE001 - every failure is a sentence
-                    failures.append(f"{entry['id']} {release['version']}: no answer ({error})")
-                    continue
-                if status >= 400:
-                    failures.append(f"{entry['id']} {release['version']}: HTTP {status}")
+        pairs, left_out = availability_targets(entries, arguments.all, arguments.limit)
+        failures, unasked = check_availability(pairs)
+        if left_out:
+            print(f"{left_out} address(es) not asked this run (--limit {arguments.limit}).")
+        if unasked:
+            print(f"{unasked} address(es) not asked: the {AVAILABILITY_BUDGET} s budget ran out.")
+            pairs = pairs[: len(pairs) - unasked]
         if failures:
             print("Addresses that did not answer:")
             for failure in failures:
                 print(f"  - {failure}")
             return 1
-        print(f"{checked} address(es) answer. (Availability only; `verify` checks the bytes.)")
+        print(f"{len(pairs)} address(es) answer. (Availability only; `verify` checks the bytes.)")
         return 0
 
     if arguments.changed:
