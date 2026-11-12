@@ -137,5 +137,83 @@ class PackageVerification(unittest.TestCase):
         self.assertIn("could not be downloaded", problems[0])
 
 
+class ChangedReleases(unittest.TestCase):
+    """A pull request downloads what it changes, not the whole catalog."""
+
+    def test_a_new_entry_verifies_every_release(self):
+        entry = fixture("org.example.fixture.json")
+        self.assertEqual(catalog.changed_releases(entry, None), entry["releases"])
+
+    def test_an_unchanged_release_is_not_downloaded_again(self):
+        before = fixture("org.example.fixture.json")
+        after = json.loads(json.dumps(before))
+        after["summary"] = "Reworded summary."
+        after["releases"][0]["published"] = "2026-11-12"
+        self.assertEqual(catalog.changed_releases(after, before), [])
+
+    def test_a_new_version_is_the_only_one_verified(self):
+        before = fixture("org.example.fixture.json")
+        after = json.loads(json.dumps(before))
+        new = dict(after["releases"][0], version="1.1.0", url="https://example.org/fixture-1.1.0.zip")
+        after["releases"].insert(0, new)
+        self.assertEqual([r["version"] for r in catalog.changed_releases(after, before)], ["1.1.0"])
+
+    def test_a_changed_checksum_or_address_is_verified_again(self):
+        before = fixture("org.example.fixture.json")
+        for field, value in (("sha256", "1" * 64), ("url", "https://example.org/other.zip")):
+            after = json.loads(json.dumps(before))
+            after["releases"][0][field] = value
+            self.assertEqual(len(catalog.changed_releases(after, before)), 1, field)
+
+
+class Scale(unittest.TestCase):
+    """Hundreds of listings: generated test data, never part of the catalog."""
+
+    COUNT = 600
+
+    def entries(self) -> list[dict]:
+        base = fixture("org.example.fixture.json")
+        out = []
+        for index in range(self.COUNT):
+            entry = json.loads(json.dumps(base))
+            entry["id"] = f"org.example.scale.plugin{index:04d}"
+            entry["name"] = f"Scale fixture {index:04d}"
+            entry["category"] = sorted(catalog.CATEGORIES)[index % len(catalog.CATEGORIES)]
+            entry["releases"] = [
+                dict(base["releases"][0], version=f"1.{minor}.0", url=f"https://example.org/s{index}-{minor}.zip")
+                for minor in range(3, 0, -1)
+            ]
+            out.append(entry)
+        return out
+
+    def test_six_hundred_entries_validate_and_build_quickly(self):
+        import time
+
+        entries = self.entries()
+        started = time.perf_counter()
+        for entry in entries:
+            self.assertEqual(catalog.check_entry(entry, f"{entry['id']}.json"), [])
+        text = catalog.build_index(entries)
+        elapsed = time.perf_counter() - started
+        document = json.loads(text)
+        self.assertEqual(len(document["plugins"]), self.COUNT)
+        # One static document, read in one GET; small enough to keep.
+        self.assertLess(len(text.encode("utf-8")), 2 * 1024 * 1024, len(text))
+        self.assertLess(elapsed, 5.0, elapsed)
+
+    def test_a_change_to_one_entry_verifies_one_package(self):
+        entries = self.entries()
+        before = {entry["id"]: entry for entry in entries}
+        changed = json.loads(json.dumps(entries[17]))
+        changed["releases"].insert(
+            0, dict(changed["releases"][0], version="1.4.0", url="https://example.org/new.zip")
+        )
+        fetched = []
+        for entry in entries[:17] + [changed] + entries[18:]:
+            for release in catalog.changed_releases(entry, before[entry["id"]]):
+                fetched.append(release["url"])
+        self.assertEqual(fetched, ["https://example.org/new.zip"])
+
+
 if __name__ == "__main__":
     unittest.main()

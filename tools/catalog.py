@@ -6,6 +6,13 @@
     python3 tools/catalog.py build --check     fail if index.json is out of date
     python3 tools/catalog.py verify [ID ...]   download listed packages and
                                                compare them with their entries
+    python3 tools/catalog.py verify --changed REF
+                                               download only the releases a
+                                               change adds or edits against REF
+    python3 tools/catalog.py availability [--latest]
+                                               ask each listed address whether
+                                               it still answers (HEAD; nothing
+                                               is downloaded or checked)
 
 Standard library only, so it runs the same on a contributor's laptop and in
 CI without installing anything.
@@ -24,10 +31,12 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import subprocess
 import io
 import json
 import re
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
@@ -383,6 +392,88 @@ def verify_release(entry: dict, release: dict, fetch=download) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# What a change touches
+# ---------------------------------------------------------------------------
+
+# A release field whose change means the package has to be downloaded again.
+PACKAGE_FIELDS = ("version", "url", "sha256", "size", "platforms", "plugin_spec")
+
+
+def entry_at(ref: str, plugin_id: str) -> dict | None:
+    """The entry as it is at a git ref, or None when it did not exist there."""
+    result = subprocess.run(
+        ["git", "show", f"{ref}:plugins/{plugin_id}.json"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        entry = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    return entry if isinstance(entry, dict) else None
+
+
+def changed_releases(entry: dict, before: dict | None) -> list[dict]:
+    """The releases of `entry` that are new or whose package fields changed.
+
+    A release that only moved, or whose `published` date or the entry's prose
+    changed, names the same bytes and is not downloaded again. A catalog of
+    hundreds of plugins is verified at the cost of what a pull request
+    changes, not at the cost of everything listed.
+    """
+    old = {}
+    for release in (before or {}).get("releases", []) or []:
+        if isinstance(release, dict) and isinstance(release.get("version"), str):
+            old[release["version"]] = release
+    out = []
+    for release in entry["releases"]:
+        previous = old.get(release["version"])
+        if previous is None or any(previous.get(f) != release.get(f) for f in PACKAGE_FIELDS):
+            out.append(release)
+    # A changed id is a different entry: everything is new.
+    if before is not None and before.get("id") != entry.get("id"):
+        return list(entry["releases"])
+    return out
+
+
+def changed_ids(ref: str) -> list[str]:
+    """Plugin ids whose entry files differ from `ref` (added or modified)."""
+    result = subprocess.run(
+        ["git", "diff", "--name-only", "--diff-filter=AMR", f"{ref}...HEAD", "--", "plugins/"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or f"git diff against {ref} failed")
+    ids = []
+    for line in result.stdout.splitlines():
+        name = line.strip().removeprefix("plugins/")
+        if name.endswith(".json") and "/" not in name:
+            ids.append(name[: -len(".json")])
+    return ids
+
+
+def head_status(url: str) -> int:
+    """The HTTP status a HEAD request for `url` ends at (redirects followed).
+
+    Availability only: nothing is downloaded, so this says the address still
+    answers, not that the bytes still match. Integrity is `verify`'s job.
+    """
+    request = urllib.request.Request(
+        url, method="HEAD", headers={"User-Agent": "eigenmol-plugin-catalog-availability"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310 - https only
+            return response.status
+    except urllib.error.HTTPError as error:
+        return error.code
+
+
+# ---------------------------------------------------------------------------
 # Command line
 # ---------------------------------------------------------------------------
 
@@ -395,6 +486,17 @@ def main(argv: list[str] | None = None) -> int:
     build.add_argument("--check", action="store_true", help="fail if index.json is out of date")
     verify = commands.add_parser("verify", help="download packages and compare them with their entries")
     verify.add_argument("ids", nargs="*", help="plugin ids to verify; every entry when none")
+    verify.add_argument(
+        "--changed",
+        metavar="REF",
+        help="verify only the releases added or edited since REF (a pull request's base)",
+    )
+    availability = commands.add_parser(
+        "availability", help="HEAD each listed package address; downloads nothing"
+    )
+    availability.add_argument(
+        "--latest", action="store_true", help="only each plugin's newest listed release"
+    )
     arguments = parser.parse_args(argv)
 
     entries, problems = load_entries()
@@ -419,6 +521,55 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         INDEX.write_text(text, encoding="utf-8")
         print(f"Wrote index.json with {len(entries)} plugin(s).")
+        return 0
+
+    if arguments.command == "availability":
+        failures = []
+        checked = 0
+        for entry in entries:
+            releases = entry["releases"][:1] if arguments.latest else entry["releases"]
+            for release in releases:
+                checked += 1
+                try:
+                    status = head_status(release["url"])
+                except Exception as error:  # noqa: BLE001 - every failure is a sentence
+                    failures.append(f"{entry['id']} {release['version']}: no answer ({error})")
+                    continue
+                if status >= 400:
+                    failures.append(f"{entry['id']} {release['version']}: HTTP {status}")
+        if failures:
+            print("Addresses that did not answer:")
+            for failure in failures:
+                print(f"  - {failure}")
+            return 1
+        print(f"{checked} address(es) answer. (Availability only; `verify` checks the bytes.)")
+        return 0
+
+    if arguments.changed:
+        by_id = {entry["id"]: entry for entry in entries}
+        try:
+            ids = changed_ids(arguments.changed)
+        except RuntimeError as error:
+            print(error)
+            return 1
+        failures = []
+        checked = 0
+        for plugin_id in ids:
+            entry = by_id.get(plugin_id)
+            if entry is None:
+                continue  # removed or renamed away: nothing to download
+            for release in changed_releases(entry, entry_at(arguments.changed, plugin_id)):
+                checked += 1
+                failures.extend(verify_release(entry, release))
+        if failures:
+            print("Verification failed:")
+            for failure in failures:
+                print(f"  - {failure}")
+            return 1
+        print(
+            f"{checked} changed package(s) match their entries "
+            f"({len(ids)} entr{'y' if len(ids) == 1 else 'ies'} changed)."
+        )
         return 0
 
     wanted = set(arguments.ids)
