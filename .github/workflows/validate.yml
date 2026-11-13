@@ -1,18 +1,38 @@
 name: Validate catalog
 
-# Runs on every pull request and on main. Reads entries and downloads the
-# packages a change lists; it never extracts or runs a package. The token is
-# read-only and a pull request from a fork gets no secrets.
+# Pull requests: the entry rules, index.json regenerated and compared, and the
+# packages of the releases the change adds or edits downloaded and compared
+# with their entries. Releases the change does not touch are not downloaded
+# again, so a catalog of hundreds of plugins costs what a pull request
+# changes.
+#
+# main: the same metadata checks, and no downloads — every package on main
+# was verified by the pull request that added it.
+#
+# Weekly: the metadata checks, and — as its own job that never fails the
+# run — an availability report asking each plugin's newest package address
+# whether it still answers: HEAD, or a one-byte ranged GET where a server
+# refuses HEAD (403/405/501). At most 300 addresses, 15 s each, 15 min in
+# all; beyond 300 the weekly runs rotate through the catalog, so every listing
+# is asked once every ceil(N / 300) weeks. That is not an integrity check, and
+# it is reported only as availability.
+# `workflow_dispatch` can download and verify named plugins on demand.
+#
+# Nothing here extracts or runs a package. The token is read-only and a pull
+# request from a fork gets no secrets.
 
 on:
   pull_request:
   push:
     branches: [main]
   schedule:
-    # Weekly: a listed download that has disappeared or changed is found here
-    # rather than by a user.
     - cron: "17 3 * * 1"
   workflow_dispatch:
+    inputs:
+      ids:
+        description: "Plugin ids to download and verify (space separated; empty: none)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -20,6 +40,7 @@ permissions:
 jobs:
   validate:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
@@ -34,20 +55,26 @@ jobs:
       - name: index.json is generated from plugins/
         run: python3 tools/catalog.py build --check
 
-      - name: The packages this change lists match their entries
+      - name: The releases this change adds or edits match their packages
         if: github.event_name == 'pull_request'
+        run: python3 tools/catalog.py verify --changed "origin/${{ github.base_ref }}"
+
+      - name: Verify the plugins named by hand
+        if: github.event_name == 'workflow_dispatch' && inputs.ids != ''
         env:
-          BASE: ${{ github.base_ref }}
+          IDS: ${{ inputs.ids }}
         run: |
           set -f
-          ids=$(git diff --name-only --diff-filter=AM "origin/${BASE}...HEAD" -- 'plugins/*.json' \
-            | sed -n 's#^plugins/\(.*\)\.json$#\1#p')
-          if [ -n "$ids" ]; then
-            python3 tools/catalog.py verify $ids
-          else
-            echo "No entry was added or changed."
-          fi
+          python3 tools/catalog.py verify $IDS
 
-      - name: Every listed package matches its entry
-        if: github.event_name != 'pull_request'
-        run: python3 tools/catalog.py verify
+  # A report, not a gate: a host that is slow or down for an hour must not
+  # turn the catalog red, and a pull request never waits for it.
+  availability:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Newest package addresses still answer (availability only)
+        run: python3 tools/catalog.py availability --limit 300

@@ -6,6 +6,17 @@
     python3 tools/catalog.py build --check     fail if index.json is out of date
     python3 tools/catalog.py verify [ID ...]   download listed packages and
                                                compare them with their entries
+    python3 tools/catalog.py verify --changed REF
+                                               download only the releases a
+                                               change adds or edits against REF
+    python3 tools/catalog.py availability [--all] [--limit N] [--week W]
+                                               ask each plugin's newest package
+                                               address whether it still answers
+                                               (HEAD, or a 1-byte ranged GET where
+                                               HEAD is refused; nothing else is
+                                               downloaded or checked). Beyond
+                                               --limit, weekly runs rotate
+                                               through every listing
 
 Standard library only, so it runs the same on a contributor's laptop and in
 CI without installing anything.
@@ -24,10 +35,12 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import subprocess
 import io
 import json
 import re
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
@@ -383,6 +396,219 @@ def verify_release(entry: dict, release: dict, fetch=download) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# What a change touches
+# ---------------------------------------------------------------------------
+
+# A release field whose change means the package has to be downloaded again.
+PACKAGE_FIELDS = ("version", "url", "sha256", "size", "platforms", "plugin_spec")
+
+
+def entry_at(ref: str, plugin_id: str, root: Path = ROOT) -> dict | None:
+    """The entry as it is at a git ref, or None when it did not exist there."""
+    result = subprocess.run(
+        ["git", "show", f"{ref}:plugins/{plugin_id}.json"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        entry = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    return entry if isinstance(entry, dict) else None
+
+
+def changed_releases(entry: dict, before: dict | None) -> list[dict]:
+    """The releases of `entry` that are new or whose package fields changed.
+
+    A release that only moved, or whose `published` date or the entry's prose
+    changed, names the same bytes and is not downloaded again. A catalog of
+    hundreds of plugins is verified at the cost of what a pull request
+    changes, not at the cost of everything listed.
+    """
+    old = {}
+    for release in (before or {}).get("releases", []) or []:
+        if isinstance(release, dict) and isinstance(release.get("version"), str):
+            old[release["version"]] = release
+    out = []
+    for release in entry["releases"]:
+        previous = old.get(release["version"])
+        if previous is None or any(previous.get(f) != release.get(f) for f in PACKAGE_FIELDS):
+            out.append(release)
+    # A changed id is a different entry: everything is new.
+    if before is not None and before.get("id") != entry.get("id"):
+        return list(entry["releases"])
+    return out
+
+
+def changed_ids(ref: str, root: Path = ROOT) -> list[str]:
+    """Plugin ids whose entry files differ from `ref`: added, modified, or the
+    new name of a renamed file. A deleted entry names nothing to download."""
+    result = subprocess.run(
+        ["git", "diff", "--name-only", "--diff-filter=AMR", f"{ref}...HEAD", "--", "plugins/"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or f"git diff against {ref} failed")
+    ids = []
+    for line in result.stdout.splitlines():
+        name = line.strip().removeprefix("plugins/")
+        if name.endswith(".json") and "/" not in name:
+            ids.append(name[: -len(".json")])
+    return ids
+
+
+# The answers to a HEAD request that mean "this server does not do HEAD here",
+# not "the file is gone". GitHub's release CDN and some object stores answer
+# HEAD with 403 or 405; a ranged GET of one byte asks the same question.
+HEAD_NOT_SUPPORTED = {403, 405, 501}
+
+# Availability limits: a weekly report, not a crawl. One request per listed
+# address (two when HEAD is refused), each with its own timeout, and a cap on
+# how many addresses one run asks about.
+AVAILABILITY_TIMEOUT = 15
+AVAILABILITY_LIMIT = 300
+
+
+class _HttpsOnlyRedirects(urllib.request.HTTPRedirectHandler):
+    """Follows at most five redirects, and only to HTTPS addresses."""
+
+    max_redirections = 5
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: N802 - urllib API
+        if urllib.parse.urlsplit(newurl).scheme != "https":
+            raise urllib.error.HTTPError(
+                newurl, code, f"redirect to a non-HTTPS address ({newurl})", headers, fp
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(_HttpsOnlyRedirects())
+
+
+def head_status(url: str, opener=None, timeout: float = AVAILABILITY_TIMEOUT) -> tuple[int, str]:
+    """The HTTP status `url` answers with, and how it was asked (`HEAD`, or
+    `GET bytes=0-0` when the server refuses HEAD). Redirects are followed, at
+    most five and only to HTTPS.
+
+    Availability only: this says the address still answers, not that the bytes
+    still match — integrity is the SHA-256 and manifest check `verify` and the
+    application make on a download. A ranged GET **reads** at most one byte
+    and closes the connection; a server that ignores `Range` may still send
+    more before the close, so the bytes on the wire are not promised to be one.
+    """
+    opener = opener or _OPENER.open
+
+    def ask(method: str, headers: dict) -> int:
+        request = urllib.request.Request(
+            url,
+            method=method,
+            headers={"User-Agent": "eigenmol-plugin-catalog-availability", **headers},
+        )
+        try:
+            with opener(request, timeout=timeout) as response:  # noqa: S310 - https only
+                if method == "GET":
+                    response.read(1)
+                return response.status
+        except urllib.error.HTTPError as error:
+            return error.code
+
+    status = ask("HEAD", {})
+    if status in HEAD_NOT_SUPPORTED:
+        return ask("GET", {"Range": "bytes=0-0"}), "GET bytes=0-0"
+    return status, "HEAD"
+
+
+def week_number(now: float | None = None) -> int:
+    """Whole weeks since 1970-01-01 (UTC). The schedule runs weekly, so
+    consecutive runs see consecutive numbers."""
+    import time
+
+    return int((time.time() if now is None else now) // (7 * 24 * 3600))
+
+
+def _rotation_key(entry_id: str, version: str, cycle: int) -> str:
+    return hashlib.sha256(f"{cycle}:{entry_id}:{version}".encode()).hexdigest()
+
+
+def availability_targets(
+    entries: list[dict],
+    every_release: bool = False,
+    limit: int = AVAILABILITY_LIMIT,
+    week: int | None = None,
+) -> tuple[list[tuple[dict, dict]], dict]:
+    """The (entry, release) pairs one availability run asks about, and how
+    they were chosen.
+
+    By default only each plugin's newest listed release: that is the one the
+    application offers first, and older releases were verified when they were
+    added. `every_release` asks about all of them.
+
+    **Rotation.** With more addresses than `limit`, a run asks one batch, and
+    consecutive weekly runs walk the batches, so every address is asked once
+    every `batches` weeks — a catalog of 1,000 listings and a limit of 300 is
+    covered in four weeks rather than the same 300 every week. The order is a
+    SHA-256 of `cycle:id:version`, so it is reproducible from the week number
+    alone, needs no state between runs, and is reshuffled each cycle: a
+    listing added or removed shifts a batch boundary by one place for the rest
+    of that cycle at most, and nothing stays at a boundary cycle after cycle.
+    `week=None` uses the current UTC week.
+    """
+    pairs = []
+    for entry in entries:
+        releases = entry["releases"] if every_release else entry["releases"][:1]
+        pairs.extend((entry, release) for release in releases)
+    total = len(pairs)
+    limit = max(1, limit)
+    batches = max(1, -(-total // limit))
+    week = week_number() if week is None else week
+    cycle, batch = divmod(week, batches)
+    pairs.sort(key=lambda pair: _rotation_key(pair[0]["id"], pair[1]["version"], cycle))
+    chosen = pairs[batch * limit : (batch + 1) * limit]
+    return chosen, {
+        "total": total,
+        "batches": batches,
+        "batch": batch,
+        "cycle": cycle,
+        "week": week,
+        "left_out": total - len(chosen),
+    }
+
+
+AVAILABILITY_BUDGET = 900  # seconds for a whole run
+
+
+def check_availability(
+    pairs: list[tuple[dict, dict]],
+    status=head_status,
+    budget: float = AVAILABILITY_BUDGET,
+    clock=None,
+) -> tuple[list[str], int]:
+    """One sentence per address that did not answer with a success, and how
+    many addresses were not asked because the run's time budget ran out."""
+    import time
+
+    clock = clock or time.monotonic
+    started = clock()
+    failures = []
+    for index, (entry, release) in enumerate(pairs):
+        if clock() - started > budget:
+            return failures, len(pairs) - index
+        try:
+            code, method = status(release["url"])
+        except Exception as error:  # noqa: BLE001 - every failure is a sentence
+            failures.append(f"{entry['id']} {release['version']}: no answer ({error})")
+            continue
+        if code >= 400:
+            failures.append(f"{entry['id']} {release['version']}: HTTP {code} ({method})")
+    return failures, 0
+
+
+# ---------------------------------------------------------------------------
 # Command line
 # ---------------------------------------------------------------------------
 
@@ -395,6 +621,30 @@ def main(argv: list[str] | None = None) -> int:
     build.add_argument("--check", action="store_true", help="fail if index.json is out of date")
     verify = commands.add_parser("verify", help="download packages and compare them with their entries")
     verify.add_argument("ids", nargs="*", help="plugin ids to verify; every entry when none")
+    verify.add_argument(
+        "--changed",
+        metavar="REF",
+        help="verify only the releases added or edited since REF (a pull request's base)",
+    )
+    availability = commands.add_parser(
+        "availability",
+        help="ask each plugin's newest package address whether it answers; downloads nothing",
+    )
+    availability.add_argument(
+        "--all", action="store_true", help="every listed release, not only each plugin's newest"
+    )
+    availability.add_argument(
+        "--limit",
+        type=int,
+        default=AVAILABILITY_LIMIT,
+        help=f"ask about at most this many addresses (default {AVAILABILITY_LIMIT})",
+    )
+    availability.add_argument(
+        "--week",
+        type=int,
+        default=None,
+        help="the week number to rotate from (default: this UTC week); for a re-run or a test",
+    )
     arguments = parser.parse_args(argv)
 
     entries, problems = load_entries()
@@ -419,6 +669,53 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         INDEX.write_text(text, encoding="utf-8")
         print(f"Wrote index.json with {len(entries)} plugin(s).")
+        return 0
+
+    if arguments.command == "availability":
+        pairs, info = availability_targets(entries, arguments.all, arguments.limit, arguments.week)
+        failures, unasked = check_availability(pairs)
+        if info["batches"] > 1:
+            print(
+                f"Week {info['week']}: batch {info['batch'] + 1} of {info['batches']} "
+                f"(cycle {info['cycle']}) — {len(pairs)} of {info['total']} address(es) this run; "
+                f"each is asked once every {info['batches']} weeks."
+            )
+        if unasked:
+            print(f"{unasked} address(es) not asked: the {AVAILABILITY_BUDGET} s budget ran out.")
+            pairs = pairs[: len(pairs) - unasked]
+        if failures:
+            print("Addresses that did not answer:")
+            for failure in failures:
+                print(f"  - {failure}")
+            return 1
+        print(f"{len(pairs)} address(es) answer. (Availability only; `verify` checks the bytes.)")
+        return 0
+
+    if arguments.changed:
+        by_id = {entry["id"]: entry for entry in entries}
+        try:
+            ids = changed_ids(arguments.changed)
+        except RuntimeError as error:
+            print(error)
+            return 1
+        failures = []
+        checked = 0
+        for plugin_id in ids:
+            entry = by_id.get(plugin_id)
+            if entry is None:
+                continue  # removed or renamed away: nothing to download
+            for release in changed_releases(entry, entry_at(arguments.changed, plugin_id)):
+                checked += 1
+                failures.extend(verify_release(entry, release))
+        if failures:
+            print("Verification failed:")
+            for failure in failures:
+                print(f"  - {failure}")
+            return 1
+        print(
+            f"{checked} changed package(s) match their entries "
+            f"({len(ids)} entr{'y' if len(ids) == 1 else 'ies'} changed)."
+        )
         return 0
 
     wanted = set(arguments.ids)
