@@ -275,12 +275,28 @@ class Availability(unittest.TestCase):
 
     def test_only_the_newest_release_by_default_and_a_cap(self):
         entries = Scale().entries()
-        pairs, left = catalog.availability_targets(entries)
+        pairs, info = catalog.availability_targets(entries, week=0)
         self.assertEqual(len(pairs), catalog.AVAILABILITY_LIMIT)
-        self.assertEqual(left, len(entries) - catalog.AVAILABILITY_LIMIT)
+        self.assertEqual(info["left_out"], len(entries) - catalog.AVAILABILITY_LIMIT)
         self.assertTrue(all(release is entry["releases"][0] for entry, release in pairs))
-        every, _ = catalog.availability_targets(entries, every_release=True, limit=10_000)
+        every, _ = catalog.availability_targets(entries, every_release=True, limit=10_000, week=0)
         self.assertEqual(len(every), 3 * len(entries))
+
+    def test_a_redirect_to_plain_http_is_refused(self):
+        import email.message
+        import urllib.error
+
+        handler = catalog._HttpsOnlyRedirects()
+        request = __import__("urllib.request").request.Request("https://example.org/a.zip", method="HEAD")
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            handler.redirect_request(
+                request, None, 302, "Found", email.message.Message(), "http://example.org/a.zip"
+            )
+        self.assertIn("non-HTTPS", str(caught.exception))
+        followed = handler.redirect_request(
+            request, None, 302, "Found", email.message.Message(), "https://cdn.example.org/a.zip"
+        )
+        self.assertEqual(followed.full_url, "https://cdn.example.org/a.zip")
 
     def test_failures_are_sentences_and_the_budget_stops_asking(self):
         entry = fixture("org.example.fixture.json")
@@ -305,6 +321,102 @@ class Availability(unittest.TestCase):
             clock=lambda: next(ticks),
         )
         self.assertEqual((failures, unasked), ([], 2))
+
+
+def listings(count: int, prefix: str = "p") -> list[dict]:
+    """`count` generated listings with one release each (test data only)."""
+    base = fixture("org.example.fixture.json")
+    out = []
+    for index in range(count):
+        entry = json.loads(json.dumps(base))
+        entry["id"] = f"org.example.rot.{prefix}{index:05d}"
+        entry["releases"] = [dict(base["releases"][0], url=f"https://example.org/{prefix}{index}.zip")]
+        out.append(entry)
+    return out
+
+
+def asked(entries, week, limit=catalog.AVAILABILITY_LIMIT):
+    pairs, info = catalog.availability_targets(entries, limit=limit, week=week)
+    return [entry["id"] for entry, _ in pairs], info
+
+
+class Rotation(unittest.TestCase):
+    """More listings than one run may ask about: the weekly runs walk them."""
+
+    def test_every_listing_is_asked_once_per_cycle_at_every_size(self):
+        for count in (100, 300, 301, 600, 1000):
+            entries = listings(count)
+            _, info = asked(entries, 0)
+            batches = info["batches"]
+            self.assertEqual(batches, -(-count // catalog.AVAILABILITY_LIMIT), count)
+            # Two whole cycles, starting at an arbitrary week.
+            start = 2934 - 2934 % batches
+            for cycle_start in (start, start + batches):
+                seen = []
+                for week in range(cycle_start, cycle_start + batches):
+                    ids, info = asked(entries, week)
+                    self.assertLessEqual(len(ids), catalog.AVAILABILITY_LIMIT)
+                    seen.extend(ids)
+                self.assertEqual(len(seen), count, count)
+                self.assertEqual(set(seen), {e["id"] for e in entries}, count)
+
+    def test_the_first_three_hundred_are_not_asked_every_week(self):
+        entries = listings(1000)
+        week1, _ = asked(entries, 2934)
+        week2, _ = asked(entries, 2935)
+        self.assertFalse(set(week1) & set(week2), "consecutive weeks ask different batches")
+        self.assertNotEqual(week1, [e["id"] for e in entries[:300]])
+
+    def test_the_choice_is_reproducible_from_the_week(self):
+        entries = listings(600)
+        self.assertEqual(asked(entries, 3001)[0], asked(entries, 3001)[0])
+        self.assertEqual(asked(list(reversed(entries)), 3001)[0], asked(entries, 3001)[0])
+
+    def test_a_listing_added_or_removed_mid_cycle_is_covered_next_cycle(self):
+        entries = listings(1000)
+        batches = asked(entries, 0)[1]["batches"]
+        start = 3000 - 3000 % batches
+        seen = set(asked(entries, start)[0])
+        changed = [e for e in entries if e["id"] != "org.example.rot.p00500"] + listings(1, "new")
+        for week in range(start + 1, start + batches):
+            seen |= set(asked(changed, week)[0])
+        expected = {e["id"] for e in changed}
+        missed = expected - seen
+        # The shift moves a batch boundary by at most one place.
+        self.assertLessEqual(len(missed), 1, missed)
+        nxt = set()
+        for week in range(start + batches, start + 2 * batches):
+            nxt |= set(asked(changed, week)[0])
+        self.assertEqual(nxt, expected, "the next cycle covers every listing")
+
+    def test_a_new_release_is_the_one_asked(self):
+        entries = listings(301)
+        entry = entries[7]
+        entry["releases"].insert(0, dict(entry["releases"][0], version="2.0.0", url="https://example.org/new.zip"))
+        batches = asked(entries, 0)[1]["batches"]
+        urls = []
+        for week in range(0, batches):
+            pairs, _ = catalog.availability_targets(entries, week=week)
+            urls += [release["url"] for e, release in pairs if e["id"] == entry["id"]]
+        self.assertEqual(urls, ["https://example.org/new.zip"])
+
+    def test_a_week_of_failures_is_a_report_with_sentences(self):
+        entries = listings(301)
+        pairs, _ = catalog.availability_targets(entries, week=5)
+        answers = {}
+
+        def status(url):
+            index = int(url.rsplit("/p", 1)[1].split(".")[0])
+            if index % 3 == 0:
+                raise TimeoutError("timed out")
+            if index % 3 == 1:
+                return 404, "HEAD"
+            return 206, "GET bytes=0-0"
+
+        failures, unasked = catalog.check_availability(pairs, status=status)
+        self.assertEqual(unasked, 0)
+        self.assertTrue(all("no answer (timed out)" in f or "HTTP 404 (HEAD)" in f for f in failures))
+        self.assertEqual(len(failures), sum(1 for e, r in pairs if int(r["url"].rsplit("/p", 1)[1].split(".")[0]) % 3 != 2))
 
 
 class ChangedFiles(unittest.TestCase):

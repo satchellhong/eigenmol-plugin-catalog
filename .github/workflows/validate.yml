@@ -13,8 +13,9 @@ name: Validate catalog
 # run — an availability report asking each plugin's newest package address
 # whether it still answers: HEAD, or a one-byte ranged GET where a server
 # refuses HEAD (403/405/501). At most 300 addresses, 15 s each, 15 min in
-# all. That is not an integrity check, and it is reported only as
-# availability.
+# all; beyond 300 the weekly runs rotate through the catalog, so every listing
+# is asked once every ceil(N / 300) weeks. That is not an integrity check, and
+# it is reported only as availability.
 # `workflow_dispatch` can download and verify named plugins on demand.
 #
 # Nothing here extracts or runs a package. The token is read-only and a pull

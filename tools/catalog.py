@@ -9,12 +9,14 @@
     python3 tools/catalog.py verify --changed REF
                                                download only the releases a
                                                change adds or edits against REF
-    python3 tools/catalog.py availability [--all] [--limit N]
+    python3 tools/catalog.py availability [--all] [--limit N] [--week W]
                                                ask each plugin's newest package
                                                address whether it still answers
                                                (HEAD, or a 1-byte ranged GET where
                                                HEAD is refused; nothing else is
-                                               downloaded or checked)
+                                               downloaded or checked). Beyond
+                                               --limit, weekly runs rotate
+                                               through every listing
 
 Standard library only, so it runs the same on a contributor's laptop and in
 CI without installing anything.
@@ -472,14 +474,34 @@ AVAILABILITY_TIMEOUT = 15
 AVAILABILITY_LIMIT = 300
 
 
+class _HttpsOnlyRedirects(urllib.request.HTTPRedirectHandler):
+    """Follows at most five redirects, and only to HTTPS addresses."""
+
+    max_redirections = 5
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: N802 - urllib API
+        if urllib.parse.urlsplit(newurl).scheme != "https":
+            raise urllib.error.HTTPError(
+                newurl, code, f"redirect to a non-HTTPS address ({newurl})", headers, fp
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(_HttpsOnlyRedirects())
+
+
 def head_status(url: str, opener=None, timeout: float = AVAILABILITY_TIMEOUT) -> tuple[int, str]:
     """The HTTP status `url` answers with, and how it was asked (`HEAD`, or
-    `GET bytes=0-0` when the server refuses HEAD). Redirects are followed.
+    `GET bytes=0-0` when the server refuses HEAD). Redirects are followed, at
+    most five and only to HTTPS.
 
-    Availability only: at most one byte is read, so this says the address
-    still answers, not that the bytes still match. Integrity is `verify`'s job.
+    Availability only: this says the address still answers, not that the bytes
+    still match — integrity is the SHA-256 and manifest check `verify` and the
+    application make on a download. A ranged GET **reads** at most one byte
+    and closes the connection; a server that ignores `Range` may still send
+    more before the close, so the bytes on the wire are not promised to be one.
     """
-    opener = opener or urllib.request.urlopen
+    opener = opener or _OPENER.open
 
     def ask(method: str, headers: dict) -> int:
         request = urllib.request.Request(
@@ -501,21 +523,60 @@ def head_status(url: str, opener=None, timeout: float = AVAILABILITY_TIMEOUT) ->
     return status, "HEAD"
 
 
+def week_number(now: float | None = None) -> int:
+    """Whole weeks since 1970-01-01 (UTC). The schedule runs weekly, so
+    consecutive runs see consecutive numbers."""
+    import time
+
+    return int((time.time() if now is None else now) // (7 * 24 * 3600))
+
+
+def _rotation_key(entry_id: str, version: str, cycle: int) -> str:
+    return hashlib.sha256(f"{cycle}:{entry_id}:{version}".encode()).hexdigest()
+
+
 def availability_targets(
-    entries: list[dict], every_release: bool = False, limit: int = AVAILABILITY_LIMIT
-) -> tuple[list[tuple[dict, dict]], int]:
+    entries: list[dict],
+    every_release: bool = False,
+    limit: int = AVAILABILITY_LIMIT,
+    week: int | None = None,
+) -> tuple[list[tuple[dict, dict]], dict]:
     """The (entry, release) pairs one availability run asks about, and how
-    many it left out because of `limit`.
+    they were chosen.
 
     By default only each plugin's newest listed release: that is the one the
     application offers first, and older releases were verified when they were
     added. `every_release` asks about all of them.
+
+    **Rotation.** With more addresses than `limit`, a run asks one batch, and
+    consecutive weekly runs walk the batches, so every address is asked once
+    every `batches` weeks — a catalog of 1,000 listings and a limit of 300 is
+    covered in four weeks rather than the same 300 every week. The order is a
+    SHA-256 of `cycle:id:version`, so it is reproducible from the week number
+    alone, needs no state between runs, and is reshuffled each cycle: a
+    listing added or removed shifts a batch boundary by one place for the rest
+    of that cycle at most, and nothing stays at a boundary cycle after cycle.
+    `week=None` uses the current UTC week.
     """
     pairs = []
     for entry in entries:
         releases = entry["releases"] if every_release else entry["releases"][:1]
         pairs.extend((entry, release) for release in releases)
-    return pairs[:limit], max(0, len(pairs) - limit)
+    total = len(pairs)
+    limit = max(1, limit)
+    batches = max(1, -(-total // limit))
+    week = week_number() if week is None else week
+    cycle, batch = divmod(week, batches)
+    pairs.sort(key=lambda pair: _rotation_key(pair[0]["id"], pair[1]["version"], cycle))
+    chosen = pairs[batch * limit : (batch + 1) * limit]
+    return chosen, {
+        "total": total,
+        "batches": batches,
+        "batch": batch,
+        "cycle": cycle,
+        "week": week,
+        "left_out": total - len(chosen),
+    }
 
 
 AVAILABILITY_BUDGET = 900  # seconds for a whole run
@@ -578,6 +639,12 @@ def main(argv: list[str] | None = None) -> int:
         default=AVAILABILITY_LIMIT,
         help=f"ask about at most this many addresses (default {AVAILABILITY_LIMIT})",
     )
+    availability.add_argument(
+        "--week",
+        type=int,
+        default=None,
+        help="the week number to rotate from (default: this UTC week); for a re-run or a test",
+    )
     arguments = parser.parse_args(argv)
 
     entries, problems = load_entries()
@@ -605,10 +672,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if arguments.command == "availability":
-        pairs, left_out = availability_targets(entries, arguments.all, arguments.limit)
+        pairs, info = availability_targets(entries, arguments.all, arguments.limit, arguments.week)
         failures, unasked = check_availability(pairs)
-        if left_out:
-            print(f"{left_out} address(es) not asked this run (--limit {arguments.limit}).")
+        if info["batches"] > 1:
+            print(
+                f"Week {info['week']}: batch {info['batch'] + 1} of {info['batches']} "
+                f"(cycle {info['cycle']}) — {len(pairs)} of {info['total']} address(es) this run; "
+                f"each is asked once every {info['batches']} weeks."
+            )
         if unasked:
             print(f"{unasked} address(es) not asked: the {AVAILABILITY_BUDGET} s budget ran out.")
             pairs = pairs[: len(pairs) - unasked]
